@@ -17,11 +17,14 @@ const NUM = { type: ["number", "null"] };
 const STR = { type: ["string", "null"] };
 export const SCHEMA = {
   type: "object", additionalProperties: false,
-  required: ["is_invoice", "supplier_name", "supplier_tax_id", "invoice_number", "invoice_date", "shipment_date",
-    "shipment_date_label", "currency", "items", "total_net", "total_vat", "total_gross", "uncertain_fields", "notes"],
+  required: ["is_invoice", "supplier_name", "supplier_tax_id", "buyer_name", "buyer_tax_id", "invoice_number", "invoice_date",
+    "shipment_date", "shipment_date_label", "delivery_document", "order_number", "carrier", "currency", "items",
+    "total_net", "total_vat", "total_gross", "total_liters", "uncertain_fields", "notes"],
   properties: {
     is_invoice: { type: "boolean" },
-    supplier_name: STR, supplier_tax_id: STR, invoice_number: STR,
+    supplier_name: STR, supplier_tax_id: STR, buyer_name: STR, buyer_tax_id: STR, invoice_number: STR,
+    delivery_document: STR, order_number: STR, carrier: STR,
+    total_liters: { ...NUM, description: "printed total of the Liters column, if any" },
     invoice_date: { ...STR, description: "YYYY-MM-DD" },
     shipment_date: { ...STR, description: "YYYY-MM-DD" },
     shipment_date_label: STR,
@@ -29,10 +32,11 @@ export const SCHEMA = {
     items: {
       type: "array", items: {
         type: "object", additionalProperties: false,
-        required: ["name", "quantity", "unit", "package_volume_liters", "price_per_unit", "price_includes_vat",
+        required: ["name", "quantity", "unit", "package_volume_liters", "liters", "price_per_unit", "price_includes_vat",
           "amount_net", "vat_rate", "vat_amount", "amount_gross"],
         properties: {
           name: { type: "string" }, quantity: NUM, unit: STR,
+          liters: { ...NUM, description: "value of a Liters/Litry/Литры column for this line, as printed" },
           package_volume_liters: { ...NUM, description: "volume of ONE piece/package in litres, if quantity is in pieces and the volume is printed (e.g. '4L' in the name)" },
           price_per_unit: NUM, price_includes_vat: { type: ["boolean", "null"] },
           amount_net: NUM, vat_rate: NUM, vat_amount: NUM, amount_gross: NUM,
@@ -61,12 +65,19 @@ Accuracy rules — mistakes are costly, flagging is cheap:
   price_includes_vat: true/false if the column header says so, else null.
   amount_net = line value without VAT, vat_amount = VAT of the line, amount_gross = line value with VAT.
   If the invoice has no VAT, put the line total into amount_gross and leave VAT fields null.
+  liters: if the table has a separate litres column (Liters, Litry, Litri, Литры, Объём л), its value for the line, else null.
 - supplier = seller/issuer (Продавец, Поставщик, Dodavatel, Prodavac, Seller), never the buyer.
   supplier_tax_id = seller's ИНН / IČO / DIČ / PIB / VAT ID as printed.
+- buyer = customer (Покупатель, Odběratel, Kupac, Buyer, Customer), buyer_tax_id = buyer's VAT ID / IČO / ИНН as printed.
+- order_number = the buyer's order / PO number as printed, e.g. "Order B02272 from 31.07.2026" → "B02272". Null if absent.
+- carrier = carrier / vehicle as printed after "Carrier", "Dopravce", "Перевозчик", e.g. "LMT403/HF384". Null if absent.
+- delivery_document = number of a delivery note / waybill printed near the invoice number (e.g. "No WT-00000230 from 12.08.2026").
+- total_liters = printed total of the litres column (e.g. in the "Total" row), else null.
 - Dates as YYYY-MM-DD. invoice_date = date of issue.
   shipment_date = date the goods were shipped/delivered/supplied, e.g. "Дата отгрузки",
   "Документ об отгрузке № … от …", "Datum uskutečnění zdanitelného plnění" (DUZP), "Datum dodání",
-  "Datum prometa", "Delivery date", "Lieferdatum". shipment_date_label = the label you used. Null if absent.
+  "Datum prometa", "Delivery date", "Lieferdatum", or the date of the delivery document ("No WT-00000230 from 12.08.2026").
+  shipment_date_label = the label you used. Null if absent.
 - uncertain_fields: list every field you are not fully sure about (blurry, cut off, ambiguous),
   e.g. "items[0].quantity", "invoice_date". Be honest — a flagged field gets checked by a human.
 - is_invoice = false if the document is not an invoice / bill with amounts.`;
@@ -269,6 +280,8 @@ const LITRE_UNITS = new Set(["л", "l", "lt", "ltr", "litr", "litrů", "litry", 
 const TO_LITRES = { "м3": 1000, "м³": 1000, "m3": 1000, "m³": 1000, "куб.м": 1000, "дал": 10, "hl": 100, "ml": 0.001 };
 
 export function litresOf(it) {
+  const printed = num(it.liters);
+  if (printed !== null) return [printed, null];
   const q = num(it.quantity);
   const unit = (it.unit || "").trim().toLowerCase().replace(/\.$/, "");
   if (q === null) return [null, "количество не указано"];
@@ -323,6 +336,7 @@ export function checkInvoice(inv, pdfTextStr, todayIso) {
     head.push([WARN, `номер «${inv.invoice_number}» не найден в тексте PDF`]);
 
   const totals = { net: 0, vat: 0, gross: 0 }, have = { net: true, vat: true, gross: true };
+  let totalLit = 0, haveLit = true;
   inv.items.forEach((it, i) => {
     const q = num(it.quantity), p = num(it.price_per_unit);
     const net = num(it.amount_net), vat = num(it.vat_amount), gross = num(it.amount_gross), rate = num(it.vat_rate);
@@ -330,7 +344,13 @@ export function checkInvoice(inv, pdfTextStr, todayIso) {
     const [, note] = litresOf(it);
     if (note) msgs.push([note.includes("не ") ? WARN : INFO, note]);
     if (gross === null && net === null) msgs.push([ERROR, "сумма не найдена"]);
-    for (const [v, label] of [[q, "количество"], [num(it.package_volume_liters), "объём упаковки"], [p, "цена"], [net, "сумма без НДС"], [vat, "НДС"], [gross, "сумма"]])
+    const lp = num(it.liters), vol = num(it.package_volume_liters);
+    const unitL = LITRE_UNITS.has((it.unit || "").trim().toLowerCase().replace(/\.$/, ""));
+    if (lp !== null && q !== null && (vol || unitL)) {
+      const calc = unitL ? q : q * vol;
+      if (!close(calc, lp, 0.5)) msgs.push([ERROR, `литры в счёте ${fmt(lp)}, а ${unitL ? "количество" : `${fmt(q)} × ${fmt(vol)} л`} = ${fmt(calc)}`]);
+    }
+    for (const [v, label] of [[q, "количество"], [vol, "объём упаковки"], [lp, "литры"], [p, "цена"], [net, "сумма без НДС"], [vat, "НДС"], [gross, "сумма"]])
       if (!inPdf(v)) msgs.push([ERROR, `${label} ${fmt(v)} — нет в тексте PDF, возможна ошибка распознавания`]);
     if (q !== null && p !== null) {
       const expected = q * p, tol = 0.01 + q * 0.005;
@@ -343,6 +363,8 @@ export function checkInvoice(inv, pdfTextStr, todayIso) {
       msgs.push([ERROR, `без НДС + НДС ≠ с НДС: ${fmt(net)} + ${fmt(vat)} ≠ ${fmt(gross)}`]);
     if (net !== null && vat !== null && rate !== null && !close(net * rate / 100, vat, 0.02))
       msgs.push([ERROR, `НДС ${fmt(vat)} не равен ${fmt(rate)}% от ${fmt(net)}`]);
+    const [lit] = litresOf(it);
+    if (lit === null) haveLit = false; else totalLit += lit;
     let [g, gNote] = lineGross(it, inv);
     if (gNote && gNote[0] === WARN) g = null;
     for (const [k, v] of [["net", net], ["vat", vat], ["gross", g]]) { if (v === null) have[k] = false; else totals[k] += v; }
@@ -355,6 +377,11 @@ export function checkInvoice(inv, pdfTextStr, todayIso) {
     if (!inPdf(t)) head.push([ERROR, `итог ${label} ${fmt(t)} — нет в тексте PDF`]);
     if (have[k] && !close(totals[k], t, tol))
       head.push([ERROR, `сумма строк ${label} ${fmt(r2(totals[k]))} ≠ итогу в счёте ${fmt(t)} (разница ${fmt(r2(Math.abs(t - totals[k])))})`]);
+  }
+  const tl = num(inv.total_liters);
+  if (tl !== null) {
+    if (!inPdf(tl)) head.push([ERROR, `итог литров ${fmt(tl)} — нет в тексте PDF`]);
+    if (haveLit && !close(totalLit, tl, 0.5)) head.push([ERROR, `сумма литров по строкам ${fmt(r2(totalLit))} ≠ итогу в счёте ${fmt(tl)}`]);
   }
   const tn = num(inv.total_net), tv = num(inv.total_vat), tg = num(inv.total_gross);
   if (tn !== null && tv !== null && tg !== null && !close(tn + tv, tg, 0.02))
@@ -392,7 +419,7 @@ export function buildRows(inv, head, rows) {
         "Поставщик": inv.supplier_name, "№ счёта": inv.invoice_number,
         "Дата": isIso(inv.invoice_date) ? inv.invoice_date : null,
         "Дата отгрузки": isIso(inv.shipment_date) ? inv.shipment_date : null,
-        "Валюта": inv.currency,
+        "Валюта": inv.currency, "Покупатель": inv.buyer_name, "Номер заказа": inv.order_number, "Перевозчик": inv.carrier,
         // для чужих таблиц — дополнительные поля
         "Сумма без НДС": net, "НДС": vat, "Количество": q, "Ед.": it.unit, "Цена за ед.": p,
       },
@@ -401,6 +428,39 @@ export function buildRows(inv, head, rows) {
       edits: [],
     };
   });
+}
+
+const short = (s) => { s = String(s || "").replace(/,? ?KN code.*$/i, "").trim(); return s.length > 38 ? s.slice(0, 36) + "…" : s; };
+
+/** Одна итоговая строка на весь счёт: суммы и литры — итоги счёта, замечания по позициям — с номером позиции. */
+export function buildSummary(inv, head, lines) {
+  const n = inv.items.length;
+  const sum = (k) => (lines.length && lines.every((r) => r.values[k] !== null && r.values[k] !== undefined)
+    ? r2(lines.reduce((acc, r) => acc + r.values[k], 0)) : null);
+  const tg = num(inv.total_gross), tn = num(inv.total_net), tv = num(inv.total_vat), tl = num(inv.total_liters);
+  const msgs = [];
+  lines.forEach((r, i) => r.messages.forEach(([l, m]) => { if (l !== INFO) msgs.push([l, `поз. ${i + 1} (${short(inv.items[i].name)}): ${m}`]); }));
+  const gross = tg ?? sum("Сумма");
+  if (tg === null && gross !== null) msgs.push([INFO, "сумма посчитана по строкам (итога в счёте нет)"]);
+  const litres = tl ?? sum("Литры");
+  if (litres === null && n) msgs.push([WARN, "литры известны не для всех позиций — итог литров не заполнен"]);
+  else if (tl === null && litres !== null) msgs.push([INFO, "литры — сумма по строкам"]);
+  const net = tn ?? sum("Сумма без НДС");
+  const base = lines[0]?.values || {};
+  const values = {};
+  for (const k of ["Поставщик", "Покупатель", "№ счёта", "Номер заказа", "Перевозчик", "Дата", "Дата отгрузки", "Валюта"]) values[k] = base[k] ?? null;
+  if (!n) Object.assign(values, { "Поставщик": inv.supplier_name, "Покупатель": inv.buyer_name, "№ счёта": inv.invoice_number,
+    "Номер заказа": inv.order_number, "Перевозчик": inv.carrier, "Валюта": inv.currency });
+  Object.assign(values, {
+    "Название": n === 1 ? inv.items[0].name : `${n} поз.`, "Позиций": n,
+    "Сумма": gross, "Сумма без НДС": net, "НДС": tv ?? (gross !== null && net !== null ? r2(gross - net) : null),
+    "Литры": litres, "Цена за л": gross !== null && litres ? r2(gross / litres) : null,
+    "Количество": null, "Ед.": null, "Цена за ед.": null,
+  });
+  return {
+    values, messages: msgs, edits: [],
+    status: worst([...head.map(([l]) => l), ...lines.map((r) => r.status), ...msgs.map(([l]) => l)].concat(n ? [] : [ERROR])),
+  };
 }
 
 export function invoiceKey(inv) {
@@ -413,7 +473,7 @@ export function invoiceKey(inv) {
 export const NUMBER_FIELDS = new Set(["Сумма", "Литры", "Цена за л", "Сумма без НДС", "НДС", "Количество", "Цена за ед."]);
 export const DATE_FIELDS = new Set(["Дата", "Дата отгрузки"]);
 export const ROW_FIELDS = ["Название", "Сумма", "Литры", "Цена за л"];
-export const INVOICE_FIELDS = ["Поставщик", "№ счёта", "Дата", "Дата отгрузки", "Валюта"];
+export const INVOICE_FIELDS = ["Поставщик", "Покупатель", "№ счёта", "Номер заказа", "Перевозчик", "Дата", "Дата отгрузки", "Валюта"];
 
 export function parseNumber(s) {
   if (s === null || s === undefined) return null;
@@ -492,7 +552,11 @@ export async function analyze(bytes, filename, ctx) {
     return { ...res, kind: "dup_invoice", include: false, message: `счёт № ${inv.invoice_number} уже ${ctx.keys.get(key)}` };
   const [head, rows] = checkInvoice(inv, await pdfText(bytes), ctx.today);
   res.head = head;
-  res.rows = buildRows(inv, head, rows);
+  res.lines = buildRows(inv, head, rows);
+  res.layout = ctx.layout === "items" ? "items" : "summary";
+  res.rows = res.layout === "items" ? res.lines : [buildSummary(inv, head, res.lines)];
+  res.invoice.delivery_document = inv.delivery_document;
+  res.invoice.items = inv.items.map((it) => ({ name: it.name, quantity: num(it.quantity), unit: it.unit, price: num(it.price_per_unit) }));
   res.status = worst(res.rows.map((r) => r.status).concat(res.rows.length ? [] : [ERROR]));
   return res;
 }

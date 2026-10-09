@@ -3,9 +3,10 @@ import { analyze, applyEdits, askJson, validateKey, keyProblem, worst, MODELS, D
 import { kv, files, cache, askPersistent, wipeAll, emptyTable } from "./store.js";
 import { exportOurTable, readOurTable, downloadBlob, rowNotes } from "./excel.js";
 import * as own from "./owntable.js";
+import * as gs from "./gsheet.js";
 
 const $ = (id) => document.getElementById(id);
-const S = { settings: {}, mode: null, table: emptyTable(), own: null, results: [], include: {}, edits: {},
+const S = { settings: {}, mode: null, table: emptyTable(), own: null, gs: null, gsDraft: null, results: [], include: {}, edits: {},
   queue: [], done: 0, total: 0, busy: false, map: null };
 
 // ───────────────────────────── мелочи ─────────────────────────────
@@ -55,7 +56,7 @@ const RANK = { "OK": 0, "ИСПРАВЛЕНО": 1, "ПРОВЕРИТЬ": 2, "О�
 const STRIPE = { "OK": "", "ИСПРАВЛЕНО": "s-edit", "ПРОВЕРИТЬ": "s-warn", "ОШИБКА": "s-err" };
 
 function show(view) {
-  for (const v of ["viewKey", "viewChoose", "viewMap", "viewWork"]) $(v).hidden = v !== view;
+  for (const v of ["viewKey", "viewChoose", "viewGoogle", "viewMap", "viewWork"]) $(v).hidden = v !== view;
   $("headActions").hidden = view !== "viewWork";
   updateDock();
 }
@@ -63,6 +64,8 @@ function show(view) {
 // ───────────────────────────── сохранение ─────────────────────────────
 const saveTable = () => kv.set("table", S.table);
 const saveOwn = () => kv.set("own", S.own);
+const saveGs = () => kv.set("gs", S.gs);
+const layout = () => S.settings.layout || "summary";
 let pendingTimer = null;
 function savePending() {
   clearTimeout(pendingTimer);
@@ -70,6 +73,7 @@ function savePending() {
 }
 
 function unsavedRows() {
+  if (S.mode === "gsheet") return 0;
   if (S.mode === "own" && S.own) return S.own.appended - S.own.exportedAppended;
   return S.table.rows.length - (S.table.exportedRows || 0);
 }
@@ -77,9 +81,12 @@ function unsavedRows() {
 function renderChrome() {
   const chip = $("tableChip");
   if (!S.mode) { chip.replaceChildren(); return; }
-  chip.replaceChildren(S.mode === "own"
+  chip.replaceChildren(S.mode === "gsheet"
+    ? h("span", {}, "Google Таблица: ", h("b", {}, S.gs.name), ` · лист «${S.gs.sheetName}» · добавлено с сайта: ${S.gs.appended}`)
+    : S.mode === "own"
     ? h("span", {}, "Таблица: ", h("b", {}, S.own.name), ` · добавлено с сайта: ${S.own.appended}`)
     : h("span", {}, "Таблица: ", h("b", {}, "Счета.xlsx"), ` · строк: ${S.table.rows.length}`));
+  $("dlBtn").textContent = S.mode === "gsheet" ? "Открыть Google Таблицу" : "Скачать таблицу";
   const n = unsavedRows();
   $("remind").hidden = n <= 0;
   $("remindText").textContent = `С последнего скачивания добавлено ${n} ${plural(n, "строка", "строки", "строк")}. Скачайте таблицу, чтобы файл на компьютере был актуальным.`;
@@ -123,9 +130,46 @@ function showChoose(fromSettings = false) {
 }
 $("chooseCancel").addEventListener("click", () => route());
 $("chooseNew").addEventListener("click", async () => {
-  S.table = emptyTable(); S.mode = "new"; S.own = null;
-  await Promise.all([saveTable(), kv.set("mode", "new"), kv.del("own"), files.del("own-workbook")]);
+  S.table = emptyTable(); S.mode = "new"; S.own = null; S.gs = null;
+  await Promise.all([saveTable(), kv.set("mode", "new"), kv.del("own"), kv.del("gs"), files.del("own-workbook")]);
   route();
+});
+
+// ───────────────────────────── 2б. Google Таблица ─────────────────────────────
+async function showGoogle() {
+  if (!S.gsDraft?.token) { S.gsDraft = { token: gs.newToken(), url: "" }; await kv.set("gsDraft", S.gsDraft); }
+  $("gsCode").value = gs.scriptCode(S.gsDraft.token);
+  $("gsUrl").value = S.gsDraft.url || "";
+  $("gsErr").textContent = "";
+  show("viewGoogle");
+}
+$("chooseGoogle").addEventListener("click", showGoogle);
+$("gsBack").addEventListener("click", () => showChoose(!!S.mode));
+$("gsCopy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("gsCode").value); $("gsCopy").textContent = "Скопировано"; }
+  catch { $("gsCode").select(); document.execCommand("copy"); $("gsCopy").textContent = "Скопировано"; }
+  setTimeout(() => { $("gsCopy").textContent = "Скопировать код"; }, 2500);
+});
+$("gsConnect").addEventListener("click", async () => {
+  const url = $("gsUrl").value.trim();
+  $("gsErr").className = "err";
+  if (!gs.isScriptUrl(url)) { $("gsErr").textContent = "Нужна ссылка вида https://script.google.com/macros/s/…/exec — её показывает Google после «Развернуть»."; return; }
+  S.gsDraft.url = url;
+  await kv.set("gsDraft", S.gsDraft);
+  $("gsErr").className = "muted";
+  $("gsErr").textContent = "Подключаюсь к таблице…";
+  try {
+    const info = await gs.call(url, S.gsDraft.token, { action: "info" });
+    const visible = info.sheets.filter((x) => !x.hidden);
+    S.map = { source: "gsheet", name: info.name, spreadsheetUrl: info.url, url, token: S.gsDraft.token,
+      sheets: visible.map((x) => ({ name: x.name })), sheetIdx: Math.max(0, visible.findIndex((x) => x.name === info.sheet)),
+      firstValues: { sheet: info.sheet, values: info.values } };
+    $("gsErr").textContent = "";
+    await openMapping();
+  } catch (e) {
+    $("gsErr").className = "err";
+    $("gsErr").textContent = "Не получилось подключиться: " + e.message;
+  }
 });
 $("ownPicker").addEventListener("change", async (ev) => {
   const f = ev.target.files[0];
@@ -137,8 +181,8 @@ $("ownPicker").addEventListener("change", async (ev) => {
     let ours = null;
     try { ours = await readOurTable(buf.slice(0)); } catch { ours = null; }
     if (ours) {
-      S.table = { ...emptyTable(), ...ours }; S.mode = "new"; S.own = null;
-      await Promise.all([saveTable(), kv.set("mode", "new"), kv.del("own"), files.del("own-workbook")]);
+      S.table = { ...emptyTable(), ...ours }; S.mode = "new"; S.own = null; S.gs = null;
+      await Promise.all([saveTable(), kv.set("mode", "new"), kv.del("own"), kv.del("gs"), files.del("own-workbook")]);
       route();
       showNotice("good", `Таблица восстановлена: ${ours.rows.length} ${plural(ours.rows.length, "строка", "строки", "строк")}. Дубли из неё тоже будут отсекаться.`);
       return;
@@ -146,7 +190,7 @@ $("ownPicker").addEventListener("change", async (ev) => {
     const book = await own.openWorkbook(buf.slice(0));
     const visible = book.sheets.filter((s) => !s.hidden);
     if (!visible.length) throw new Error("в файле нет листов");
-    S.map = { name: f.name, buf, book, sheets: visible, sheetIdx: 0 };
+    S.map = { source: "xlsx", name: f.name, buf, book, sheets: visible, sheetIdx: 0 };
     $("chooseErr").textContent = "";
     await openMapping();
   } catch (e) {
@@ -155,20 +199,29 @@ $("ownPicker").addEventListener("change", async (ev) => {
 });
 
 // ───────────────────────────── 3. сопоставление колонок ─────────────────────────────
+async function loadMapSheet(m, i) {
+  if (m.source !== "gsheet") return own.readSheet(m.book, m.sheets[i].path);
+  const name = m.sheets[i].name;
+  if (m.firstValues?.sheet === name) return own.sheetFromValues(m.firstValues.values);
+  const info = await gs.call(m.url, m.token, { action: "info", sheet: name });
+  m.firstValues = { sheet: name, values: info.values };
+  return own.sheetFromValues(info.values);
+}
+
 async function openMapping() {
   const m = S.map;
   // лист по умолчанию — тот, где больше всего узнаваемых заголовков
-  if (m.sheet === undefined) {
+  if (m.sheet === undefined && m.source !== "gsheet") {
     let best = 0, bestScore = -1;
     for (let i = 0; i < m.sheets.length; i++) {
-      const sh = await own.readSheet(m.book, m.sheets[i].path);
+      const sh = await loadMapSheet(m, i);
       const hr = own.detectHeader(sh);
       const score = own.describeColumns(sh, hr).filter((c) => c.field).length;
       if (score > bestScore) { best = i; bestScore = score; }
     }
     m.sheetIdx = best;
   }
-  m.sheet = await own.readSheet(m.book, m.sheets[m.sheetIdx].path);
+  m.sheet = await loadMapSheet(m, m.sheetIdx);
   m.headerRow ??= own.detectHeader(m.sheet);
   m.cols = own.describeColumns(m.sheet, m.headerRow);
   m.ai = {};
@@ -179,7 +232,7 @@ async function openMapping() {
 
 function renderMapping() {
   const m = S.map;
-  $("mapIntro").textContent = `Файл «${m.name}». Сайт сопоставил колонки по названиям — проверьте и поправьте, если нужно. ` +
+  $("mapIntro").textContent = `${m.source === "gsheet" ? "Google Таблица" : "Файл"} «${m.name}». Сайт сопоставил колонки по названиям — проверьте и поправьте, если нужно. ` +
     "Колонки с «— не заполнять —» останутся пустыми.";
   $("sheetField").hidden = false;
   $("sheetSelect").replaceChildren(...m.sheets.map((s, i) => h("option", { value: i, selected: i === m.sheetIdx }, s.name)));
@@ -217,9 +270,12 @@ function renderMapping() {
   else $("mapErr").textContent = "";
 }
 
-$("sheetSelect").addEventListener("change", async (e) => { S.map.sheetIdx = +e.target.value; S.map.headerRow = undefined; await openMapping(); });
+$("sheetSelect").addEventListener("change", async (e) => {
+  S.map.sheetIdx = +e.target.value; S.map.headerRow = undefined; S.map.sheet = null;
+  try { await openMapping(); } catch (err) { $("mapErr").textContent = "Не получилось открыть лист: " + err.message; }
+});
 $("headerSelect").addEventListener("change", async (e) => { S.map.headerRow = +e.target.value; await openMapping(); });
-$("mapCancel").addEventListener("click", () => { S.map = null; showChoose(!!S.mode); });
+$("mapCancel").addEventListener("click", () => { const g = S.map?.source === "gsheet"; S.map = null; if (g) showGoogle(); else showChoose(!!S.mode); });
 
 async function suggestWithAI() {
   const m = S.map;
@@ -255,12 +311,19 @@ $("mapSave").addEventListener("click", async () => {
   const mapping = Object.fromEntries(m.cols.filter((c) => c.field).map((c) => [c.col, c.field]));
   if (!Object.keys(mapping).length) { $("mapErr").textContent = "Выберите хотя бы одну колонку, которую заполнять."; return; }
   const sheet = m.sheets[m.sheetIdx];
-  S.own = { name: m.name, sheetName: sheet.name, sheetPath: sheet.path, headerRow: m.headerRow, mapping,
-    index: own.existingIndex(m.sheet, m.headerRow, mapping), appended: 0, exportedAppended: 0 };
-  S.mode = "own";
   S.table = emptyTable();
-  await files.set("own-workbook", new Blob([m.buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
-  await Promise.all([saveOwn(), saveTable(), kv.set("mode", "own")]);
+  if (m.source === "gsheet") {
+    S.gs = { url: m.url, token: m.token, name: m.name, spreadsheetUrl: m.spreadsheetUrl, sheetName: sheet.name, headerRow: m.headerRow,
+      mapping, index: own.existingIndex(m.sheet, m.headerRow, mapping), appended: 0 };
+    S.mode = "gsheet"; S.own = null;
+    await Promise.all([saveGs(), saveTable(), kv.set("mode", "gsheet"), kv.del("own"), files.del("own-workbook")]);
+  } else {
+    S.own = { name: m.name, sheetName: sheet.name, sheetPath: sheet.path, headerRow: m.headerRow, mapping,
+      index: own.existingIndex(m.sheet, m.headerRow, mapping), appended: 0, exportedAppended: 0 };
+    S.mode = "own"; S.gs = null;
+    await files.set("own-workbook", new Blob([m.buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+    await Promise.all([saveOwn(), saveTable(), kv.set("mode", "own"), kv.del("gs")]);
+  }
   S.map = null;
   askPersistent();
   route();
@@ -297,10 +360,22 @@ function knownMaps() {
   return { keys, hashes };
 }
 
+const ownIndex = () => (S.mode === "own" ? S.own?.index : S.mode === "gsheet" ? S.gs?.index : null);
+
+async function refreshGsIndex() {
+  if (S.mode !== "gsheet") return;
+  try {
+    const info = await gs.call(S.gs.url, S.gs.token, { action: "info", sheet: S.gs.sheetName });
+    S.gs.index = own.existingIndex(own.sheetFromValues(info.values), S.gs.headerRow, S.gs.mapping);
+    await saveGs();
+  } catch { /* без связи — используем то, что знаем */ }
+}
+
 async function runQueue() {
   S.busy = true;
   $("progress").classList.add("on");
   updateDock();
+  if (S.mode === "gsheet" && !S.results.length) { $("progressText").textContent = "Сверяюсь с Google Таблицей…"; await refreshGsIndex(); }
   while (S.queue.length) {
     const f = S.queue.shift();
     $("progressText").textContent = `Распознаю ${S.done + 1} из ${S.total}: ${f.name}`;
@@ -309,13 +384,13 @@ async function runQueue() {
     try {
       const bytes = new Uint8Array(await f.arrayBuffer());
       const { keys, hashes } = knownMaps();
-      res = await analyze(bytes, f.name, { key: S.settings.key, model: S.settings.model || DEFAULT_MODEL, keys, hashes, today: todayIso(),
+      res = await analyze(bytes, f.name, { key: S.settings.key, model: S.settings.model || DEFAULT_MODEL, keys, hashes, today: todayIso(), layout: layout(),
         cacheGet: (sha) => cache.get(sha), cachePut: (sha, inv) => cache.set(sha, inv) });
       if (res.kind === "invoice") {
         await files.set("pdf:" + res.id, new Blob([bytes], { type: "application/pdf" }));
-        if (S.mode === "own" && S.own?.index) {
+        if (ownIndex()) {
           for (const row of res.rows) {
-            for (const msg of own.similarRows(S.own.index, res.invoice.number, row)) row.messages.push([WARN, msg]);
+            for (const msg of own.similarRows(ownIndex(), res.invoice.number, row)) row.messages.push([WARN, msg]);
             row.status = worst([...res.head, ...row.messages].map(([l]) => l));
           }
           res.status = worst(res.rows.map((r) => r.status));
@@ -342,7 +417,7 @@ function addResult(res, restoring = false) {
   $("emptyHint").hidden = true;
   drop.classList.add("compact");
   setDropText();
-  $("results").append(res.kind === "invoice" ? renderInvoice(res) : renderSkip(res));
+  $("results").append(res.kind !== "invoice" ? renderSkip(res) : res.layout === "summary" ? renderSummary(res) : renderInvoice(res));
   if (!restoring) savePending();
   updateDock();
 }
@@ -433,6 +508,50 @@ function renderInvoice(res) {
       h("thead", {}, h("tr", {}, h("th", {}, "Название"), h("th", { class: "num" }, "Сумма" + (first["Валюта"] ? ", " + first["Валюта"] : "")),
         h("th", { class: "num" }, "Литры"), h("th", { class: "num" }, "Цена за л"), h("th", {}, "Статус"), h("th", {}, "Что проверить"))),
       tbody)));
+  refreshStatuses(res, sec);
+  return sec;
+}
+
+function renderSummary(res) {
+  const inv = res.invoice, row = res.rows[0], v = row.values;
+  const cb = h("input", { type: "checkbox", checked: S.include[res.id], onchange: (ev) => {
+    S.include[res.id] = ev.target.checked; sec.classList.toggle("off", !ev.target.checked); savePending(); updateDock(); } });
+  const f = (label, field, cls) => h("label", {}, label, cellInput(res, "invoice", null, field, v[field], { cls }));
+  const meta = h("div", { class: "meta" },
+    f("Покупатель", "Покупатель", "w-wide"), f("№ счёта", "№ счёта", "w-mid"), f("Номер заказа", "Номер заказа", "w-mid"),
+    f("Перевозчик", "Перевозчик", "w-mid"),
+    f("Дата отгрузки" + (inv.delivery_document ? ` (${inv.delivery_document})` : inv.shipment_label ? ` (${inv.shipment_label})` : ""), "Дата отгрузки", "w-date"),
+    f("Дата счёта", "Дата", "w-date"), f("Валюта", "Валюта", "w-s"), f("Продавец", "Поставщик", "w-wide"));
+  const head = res.head.length ? h("div", { class: "head-msgs" }, res.head.map(([lvl, m]) => h("div", { class: "lvl-" + lvl }, m))) : null;
+  const totals = h("table", { class: "totals" },
+    h("colgroup", {}, ["c-sum", "c-l", "c-p", "c-st", "c-msg"].map((c) => h("col", { class: c }))),
+    h("thead", {}, h("tr", {}, h("th", { class: "num" }, "Сумма" + (v["Валюта"] ? ", " + v["Валюта"] : "")), h("th", { class: "num" }, "Литры"),
+      h("th", { class: "num" }, "Позиций"), h("th", {}, "Статус"), h("th", {}, "Что проверить"))),
+    h("tbody", {}, h("tr", { id: `row-${res.id}-0`, class: "r-" + row.status },
+      h("td", { class: "num big-num" }, cellInput(res, "rows", 0, "Сумма", v["Сумма"])),
+      h("td", { class: "num big-num" }, cellInput(res, "rows", 0, "Литры", v["Литры"])),
+      h("td", { class: "num" }, String(v["Позиций"] ?? "")),
+      h("td", {}, h("span", { class: "pill p-" + row.status, id: `rp-${res.id}-0` }, STATUS_LABEL[row.status])),
+      h("td", { class: "msgs" }, row.messages.length ? row.messages.map(([lvl, m]) => h("div", { class: "lvl-" + lvl }, m)) : h("span", { class: "lvl-info" }, "всё сошлось")))));
+  const lines = res.lines || [];
+  const bad = lines.filter((l) => l.status !== "OK").length;
+  const details = lines.length ? h("details", { class: "lines" },
+    h("summary", {}, h("b", {}, `Позиции счёта (${lines.length})`), bad ? ` — с замечаниями: ${bad}` : " — по каждой арифметика и литры сошлись"),
+    h("div", { class: "table-wrap" }, h("table", { class: "lines-table" },
+      h("colgroup", {}, ["l-n", "l-name", "l-q", "l-l", "l-p", "l-s", "l-m"].map((c) => h("col", { class: c }))),
+      h("thead", {}, h("tr", {}, ...["№", "Название", "Кол-во", "Литры", "Цена", "Сумма", "Проверка"].map((t, i) => h("th", { class: i >= 2 && i <= 5 ? "num" : "" }, t)))),
+      h("tbody", {}, lines.map((l, i) => h("tr", { class: "r-" + l.status },
+        h("td", {}, String(i + 1)), h("td", {}, l.values["Название"]),
+        h("td", { class: "num" }, l.values["Количество"] !== null ? `${fmtNum(l.values["Количество"], "Литры")} ${l.values["Ед."] || ""}` : ""),
+        h("td", { class: "num" }, fmtNum(l.values["Литры"], "Литры")),
+        h("td", { class: "num" }, l.values["Цена за ед."] !== null ? nf(2).format(l.values["Цена за ед."]) : ""),
+        h("td", { class: "num" }, fmtNum(l.values["Сумма"], "Сумма")),
+        h("td", { class: "msgs" }, l.messages.filter(([lvl]) => lvl !== "info").map(([lvl, m]) => h("div", { class: "lvl-" + lvl }, m))))))))) : null;
+  const pill = h("span", { class: "pill", id: "pill-" + res.id });
+  const sec = h("section", { class: "invoice" + (S.include[res.id] ? "" : " off"), id: "inv-" + res.id },
+    h("div", { class: "inv-top" }, h("label", {}, cb, res.filename),
+      h("a", { href: "#", onclick: (ev) => { ev.preventDefault(); openPdf(res); } }, "Открыть PDF"), h("span", { class: "spacer" }), pill),
+    meta, head, h("div", { class: "table-wrap" }, totals), details);
   refreshStatuses(res, sec);
   return sec;
 }
@@ -530,7 +649,24 @@ $("commitBtn").addEventListener("click", async () => {
       }
     }
     let ownState = S.own ? structuredClone(S.own) : null;
-    if (S.mode === "own" && items.length) {
+    let gsState = S.gs ? structuredClone(S.gs) : null;
+    if (S.mode === "gsheet" && items.length) {
+      const cols = Object.entries(gsState.mapping).filter(([, fld]) => fld).sort((a, b) => own.colToIdx(a[0]) - own.colToIdx(b[0]));
+      const NUMERIC = new Set(["Сумма", "Литры", "Позиций", "Сумма без НДС", "НДС", "Цена за л", "Количество", "Цена за ед."]);
+      const types = cols.map(([, fld]) => (fld === "Дата" || fld === "Дата отгрузки" ? "date" : NUMERIC.has(fld) ? "number" : "text"));
+      const rows = items.map((it) => cols.map(([, fld]) => own.rowValue(fld, it.row, it.file, it.notes)));
+      const pos = await gs.call(gsState.url, gsState.token, { action: "append", sheet: gsState.sheetName, headerRow: gsState.headerRow,
+        columns: cols.map(([c]) => own.colToIdx(c)), types, rows });
+      gsState.appended += items.length;
+      gsState.lastUrl = pos.url;
+      for (const s of starts) {
+        const where = `в Google Таблице (строка ${pos.first + s.idx}, ${s.r.filename})`;
+        if (s.r.key) table.keys[s.r.key] = where;
+        table.hashes[s.r.sha] = where;
+        const n = s.r.invoice.number ? String(s.r.invoice.number).toLowerCase().replace(/[\W_]/gu, "") : null;
+        if (n) gsState.index.numbers[n] ??= pos.first + s.idx;
+      }
+    } else if (S.mode === "own" && items.length) {
       const blob = await files.get("own-workbook");
       const book = await own.openWorkbook(await blob.arrayBuffer());
       const pos = await own.appendRows(book, ownState.sheetPath, ownState.headerRow, ownState.mapping, items);
@@ -552,14 +688,16 @@ $("commitBtn").addEventListener("click", async () => {
     }
     S.table = table;
     S.own = ownState;
-    await Promise.all([saveTable(), S.own ? saveOwn() : null]);
+    S.gs = gsState;
+    await Promise.all([saveTable(), S.own ? saveOwn() : null, S.gs ? saveGs() : null]);
     for (const r of S.results) files.del("pdf:" + r.id).catch(() => {});
     resetList();
     await kv.del("pending");
-    const parts = [`Добавлено ${added} ${plural(added, "строка", "строки", "строк")} в ${S.mode === "own" ? "«" + S.own.name + "»" : "таблицу"}`];
+    const where = S.mode === "gsheet" ? `Google Таблицу «${S.gs.name}»` : S.mode === "own" ? "«" + S.own.name + "»" : "таблицу";
+    const parts = [`Добавлено ${added} ${plural(added, "строка", "строки", "строк")} в ${where}`];
     if (dups) parts.push(`дублей пропущено: ${dups}`);
     if (skipped) parts.push(`не добавлено по вашему выбору: ${skipped}`);
-    showNotice("good", parts.join("; ") + ".", added ? h("button", { class: "btn", type: "button", onclick: download }, "Скачать таблицу") : null);
+    showNotice("good", parts.join("; ") + ".", added ? h("button", { class: "btn", type: "button", onclick: download }, S.mode === "gsheet" ? "Открыть Google Таблицу" : "Скачать таблицу") : null);
     renderChrome();
   } catch (e) {
     showNotice("bad", "Не получилось записать: " + e.message);
@@ -584,13 +722,14 @@ $("clearBtn").addEventListener("click", async () => {
 // ───────────────────────────── скачивание ─────────────────────────────
 async function download() {
   try {
+    if (S.mode === "gsheet") { window.open(S.gs.lastUrl || S.gs.spreadsheetUrl, "_blank", "noopener"); return; }
     if (S.mode === "own") {
       const blob = await files.get("own-workbook");
       downloadBlob(blob, S.own.name);
       S.own.exportedAppended = S.own.appended;
       await saveOwn();
     } else {
-      downloadBlob(await exportOurTable(S.table), "Счета.xlsx");
+      downloadBlob(await exportOurTable(S.table, layout()), "Счета.xlsx");
       S.table.exportedRows = S.table.rows.length;
       await saveTable();
     }
@@ -607,10 +746,16 @@ function renderSettings() {
   const k = S.settings.key || "";
   $("keyMasked").textContent = k ? `Сейчас: ${k.slice(0, 8)}…${k.slice(-4)}` : "Ключ не задан";
   $("modelSelect").replaceChildren(...Object.entries(MODELS).map(([id, m]) => h("option", { value: id, selected: id === (S.settings.model || DEFAULT_MODEL) }, m.label)));
-  $("tableInfo").textContent = S.mode === "own"
+  $("layoutSelect").value = layout();
+  $("dlBtn2").textContent = S.mode === "gsheet" ? "Открыть Google Таблицу" : "Скачать таблицу";
+  $("tableInfo").textContent = S.mode === "gsheet"
+    ? `Google Таблица «${S.gs.name}», лист «${S.gs.sheetName}». Добавлено с сайта: ${S.gs.appended}.`
+    : S.mode === "own"
     ? `Ваша таблица «${S.own.name}», лист «${S.own.sheetName}». Добавлено с сайта: ${S.own.appended}.`
     : `Таблица сайта «Счета.xlsx», строк: ${S.table.rows.length}.`;
-  $("dlCopy").hidden = S.mode !== "own";
+  $("dlCopy").hidden = S.mode === "new";
+  $("shareBox").hidden = S.mode !== "gsheet";
+  if (S.mode === "gsheet") $("shareLink").value = setupLink();
   const j = S.table.journal || [];
   const ym = (t) => (t || "").slice(3, 10);
   const month = ym(stamp());
@@ -627,7 +772,8 @@ $("settingsClose").addEventListener("click", () => $("settings").close());
 $("keySave2").addEventListener("click", () => saveKey($("keyInput2"), $("keyErr2"), renderSettings));
 $("modelSelect").addEventListener("change", async (e) => { S.settings.model = e.target.value; await kv.set("settings", S.settings); });
 $("dlBtn2").addEventListener("click", download);
-$("dlCopy").addEventListener("click", async () => downloadBlob(await exportOurTable(S.table), "Счета (журнал сайта).xlsx"));
+$("dlCopy").addEventListener("click", async () => downloadBlob(await exportOurTable(S.table, layout()), "Счета (журнал сайта).xlsx"));
+$("layoutSelect").addEventListener("change", async (e) => { S.settings.layout = e.target.value; await kv.set("settings", S.settings); });
 $("changeTable").addEventListener("click", () => { $("settings").close(); showChoose(true); });
 $("wipeBtn").addEventListener("click", async (e) => {
   if (!e.target.dataset.armed) { e.target.dataset.armed = "1"; e.target.textContent = "Нажмите ещё раз — ключ, таблица и журнал будут стёрты"; return; }
@@ -635,10 +781,45 @@ $("wipeBtn").addEventListener("click", async (e) => {
   location.reload();
 });
 
+// ───────────────────────────── ссылка с готовой настройкой ─────────────────────────────
+const b64url = (str) => btoa(String.fromCharCode(...new TextEncoder().encode(str))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64url = (str) => new TextDecoder().decode(Uint8Array.from(atob(str.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)));
+
+function setupLink() {
+  const g = S.gs;
+  const payload = { v: 1, url: g.url, token: g.token, name: g.name, spreadsheetUrl: g.spreadsheetUrl, sheetName: g.sheetName,
+    headerRow: g.headerRow, mapping: g.mapping, layout: layout() };
+  return `${location.origin}${location.pathname}#setup=${b64url(JSON.stringify(payload))}`;
+}
+$("shareCopy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("shareLink").value); } catch { $("shareLink").select(); document.execCommand("copy"); }
+  $("shareCopy").textContent = "Скопировано";
+  setTimeout(() => { $("shareCopy").textContent = "Скопировать ссылку"; }, 2500);
+});
+
+/** Открыли ссылку с настройкой — подключаем Google Таблицу без вопросов. */
+async function applySetupFromLink() {
+  const m = location.hash.match(/^#setup=([\w-]+)$/);
+  if (!m) return null;
+  history.replaceState(null, "", location.pathname + location.search);
+  try {
+    const p = JSON.parse(unb64url(m[1]));
+    if (!gs.isScriptUrl(p.url) || !p.token || !p.sheetName || !p.mapping) throw new Error("неполная ссылка");
+    S.gs = { url: p.url, token: p.token, name: p.name || "Google Таблица", spreadsheetUrl: p.spreadsheetUrl, sheetName: p.sheetName,
+      headerRow: +p.headerRow || 1, mapping: p.mapping, index: { numbers: {}, fuzzy: [], orders: [] }, appended: 0 };
+    S.mode = "gsheet"; S.own = null; S.table = emptyTable();
+    if (p.layout) { S.settings.layout = p.layout; await kv.set("settings", S.settings); }
+    await Promise.all([saveGs(), saveTable(), kv.set("mode", "gsheet"), kv.del("own"), files.del("own-workbook")]);
+    return `Подключена Google Таблица «${S.gs.name}», лист «${S.gs.sheetName}». Можно работать.`;
+  } catch (e) {
+    return "Ссылка с настройкой не сработала: " + e.message;
+  }
+}
+
 // ───────────────────────────── запуск ─────────────────────────────
 async function route() {
   if (!S.settings.key) { show("viewKey"); renderChrome(); return; }
-  if (!S.mode || (S.mode === "own" && !S.own)) { showChoose(false); renderChrome(); return; }
+  if (!S.mode || (S.mode === "own" && !S.own) || (S.mode === "gsheet" && !S.gs)) { showChoose(false); renderChrome(); return; }
   show("viewWork");
   renderChrome();
 }
@@ -649,8 +830,15 @@ async function init() {
     S.mode = (await kv.get("mode")) || null;
     S.table = (await kv.get("table")) || emptyTable();
     S.own = (await kv.get("own")) || null;
+    S.gs = (await kv.get("gs")) || null;
+    S.gsDraft = (await kv.get("gsDraft")) || null;
     const pending = await kv.get("pending");
+    const setupMsg = await applySetupFromLink();
     await route();
+    if (setupMsg) {
+      if (!$("viewWork").hidden) showNotice(setupMsg.startsWith("Подключена") ? "good" : "bad", setupMsg);
+      else $(S.settings.key ? "chooseErr" : "keyErr").textContent = setupMsg;
+    }
     if (pending?.results?.length && !$("viewWork").hidden) {
       S.include = pending.include || {};
       S.edits = pending.edits || {};

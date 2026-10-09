@@ -9,7 +9,8 @@ const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.s
 
 // Поля, которые сайт умеет заполнять (ключ → подпись в списке)
 export const FIELDS = [
-  ["Название", "Название товара"], ["Сумма", "Сумма с НДС"], ["Сумма без НДС", "Сумма без НДС"], ["НДС", "НДС (сумма)"],
+  ["Покупатель", "Покупатель"], ["Номер заказа", "Номер заказа"], ["Перевозчик", "Перевозчик (машина)"],
+  ["Название", "Название товара (или «N поз.»)"], ["Позиций", "Число позиций в счёте"], ["Сумма", "Сумма (итог с НДС)"], ["Сумма без НДС", "Сумма без НДС"], ["НДС", "НДС (сумма)"],
   ["Литры", "Литры"], ["Количество", "Количество (как в счёте)"], ["Ед.", "Единица (л, ks, шт…)"],
   ["Цена за л", "Цена за литр"], ["Цена за ед.", "Цена за единицу"], ["Дата", "Дата счёта"], ["Дата отгрузки", "Дата отгрузки"],
   ["Валюта", "Валюта"], ["Поставщик", "Поставщик"], ["№ счёта", "№ счёта"],
@@ -109,6 +110,9 @@ export const normalize = (s) => String(s ?? "").toLowerCase().normalize("NFD").r
 const PRICE = /цена|cena|price|preis|cijena/;
 const TOTALISH = /итог|всего|сумм|celkem|castka|total|amount|ukupno|iznos/;
 const RULES = [
+  ["Покупатель", /покупател|заказчик|клиент|buyer|customer|odberatel|kupac|zakaznik|kunde|abnehmer/],
+  ["Номер заказа", /заказ|order|objednav|narudzb|bestell|^po\b|purchase/],
+  ["Перевозчик", /перевоз|carrier|dopravce|prevoznik|spedit|truck|vehicle|машин|авто/],
   ["Дата отгрузки", /отгруз|поставк|duzp|zdanitel|uskut|dodan|dodaci|deliver|shipment|shipping|lieferdat|promet/],
   ["№ счёта", /№|номер|^(no|nr|n)\.?( |$)|cislo|invoice ?(no|number|#)|^faktura$|doklad|rechnungs?n|^inv(oice)?$|^broj/],
   ["Дата", /дата|datum|^date|date$|vystaven|ausgestellt/],
@@ -205,18 +209,20 @@ export function totalsRowHint(sheet, headerRow) {
 /** Что уже есть в таблице брата — для предупреждений о дублях. */
 export function existingIndex(sheet, headerRow, mapping) {
   const colOf = Object.fromEntries(Object.entries(mapping).filter(([, f]) => f).map(([c, f]) => [f, c]));
-  const numbers = {}, fuzzy = [];
+  const numbers = {}, fuzzy = [], orders = [];
   for (const [rn, cells] of sheet.rows) {
     if (rn <= headerRow) continue;
     const get = (f) => (colOf[f] ? cells.get(colOf[f]) : null);
     const n = get("№ счёта")?.v;
     if (n !== null && n !== undefined) numbers[String(n).toLowerCase().replace(/[\W_]/gu, "")] = rn;
+    const o = get("Номер заказа")?.v;
+    if (o !== null && o !== undefined && String(o).trim()) orders.push({ row: rn, text: String(o).toLowerCase().replace(/[\W_]/gu, "") });
     const d = get("Дата")?.isDate ? serialToIso(get("Дата").v) : null;
     const sum = typeof get("Сумма")?.v === "number" ? get("Сумма").v : typeof get("Сумма без НДС")?.v === "number" ? get("Сумма без НДС").v : null;
     const lit = typeof get("Литры")?.v === "number" ? get("Литры").v : null;
     if (sum !== null || lit !== null) fuzzy.push({ row: rn, date: d, sum, lit });
   }
-  return { numbers, fuzzy };
+  return { numbers, fuzzy, orders };
 }
 
 /** Предупреждения о возможных дублях со старыми строками таблицы брата. */
@@ -225,6 +231,9 @@ export function similarRows(index, invNumber, row) {
   const n = invNumber ? String(invNumber).toLowerCase().replace(/[\W_]/gu, "") : null;
   if (n && index.numbers[n]) out.push(`счёт № ${invNumber} уже встречается в вашей таблице (строка ${index.numbers[n]}) — проверьте, не дубль ли`);
   const v = row.values;
+  const ord = v["Номер заказа"] ? String(v["Номер заказа"]).toLowerCase().replace(/[\W_]/gu, "") : null;
+  const oh = ord && ord.length >= 4 ? (index.orders || []).find((o) => o.text.includes(ord)) : null;
+  if (oh) out.push(`заказ ${v["Номер заказа"]} уже встречается в вашей таблице (строка ${oh.row}) — проверьте, не дубль ли`);
   const near = (a, b) => a !== null && b !== null && b !== undefined && Math.abs(a - b) < 0.01;
   const hit = index.fuzzy.find((f) => (f.date ? f.date === v["Дата"] : true) &&
     ((near(f.sum, v["Сумма"]) || near(f.sum, v["Сумма без НДС"])) && (f.lit === null || near(f.lit, v["Литры"]))) && (f.date || f.lit !== null));
@@ -233,7 +242,7 @@ export function similarRows(index, invNumber, row) {
 }
 
 // ── дописывание строк ──
-function rowValue(field, row, file, notes) {
+export function rowValue(field, row, file, notes) {
   if (field === "_status") return row.status;
   if (field === "_notes") return notes;
   if (field === "_file") return file;
@@ -348,6 +357,33 @@ export async function appendRows(book, sheetPath, headerRow, mapping, items) {
     }
   }
   return { first: last + 1, last: newLast };
+}
+
+/** Лист из «таблицы значений» (как отдаёт Google Таблица): даты дд.мм.гггг и числа распознаются. */
+export function sheetFromValues(values) {
+  const rows = new Map();
+  let maxRow = 0;
+  values.forEach((row, i) => {
+    const cells = new Map();
+    row.forEach((raw, j) => {
+      const t = String(raw ?? "").trim();
+      if (!t) return;
+      let v = t, isDate = false;
+      const d = t.match(/^(\d{1,2})[./](\d{1,2})[./](\d{4})$/);
+      const numText = t.replace(/[€$£₽]|Kč|CZK|EUR|RSD|руб\.?|\u00a0|\u202f|\s/gi, "");
+      if (d) { v = (Date.UTC(+d[3], +d[2] - 1, +d[1]) - Date.UTC(1899, 11, 30)) / 86400000; isDate = true; }
+      else if (/^-?\d[\d.,]*$/.test(numText)) {
+        let n = numText;
+        if (n.includes(",") && n.includes(".")) { const dec = n.lastIndexOf(",") > n.lastIndexOf(".") ? "," : "."; n = n.split(dec === "," ? "." : ",").join("").replace(dec, "."); }
+        else if (n.includes(",")) n = n.split(",").length > 2 ? n.split(",").join("") : n.replace(",", ".");
+        if (Number.isFinite(Number(n))) v = Number(n);
+      }
+      cells.set(idxToCol(j + 1), { v, t: null, s: null, f: null, isDate });
+    });
+    rows.set(i + 1, cells);
+    if (cells.size) maxRow = i + 1;
+  });
+  return { rows, maxRow };
 }
 
 export async function toBlob(book) {

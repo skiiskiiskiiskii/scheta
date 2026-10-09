@@ -2,12 +2,19 @@
 // Формат совпадает с Python-версией: лист «Счета», «Журнал» и скрытый «_служебное».
 import { OK, WARN, ERROR, EDITED } from "./core.js";
 
-export const COLUMNS = [
+export const COLUMNS_ITEMS = [
   ["Название", 34], ["Сумма", 14], ["Литры", 11], ["Дата", 11], ["Дата отгрузки", 14], ["Валюта", 10], ["Цена за л", 12],
   ["Поставщик", 28], ["№ счёта", 13], ["Статус", 12], ["Что проверить", 55], ["Файл", 34],
 ];
+export const COLUMNS_SUMMARY = [
+  ["Дата отгрузки", 13], ["№ счёта", 14], ["Номер заказа", 14], ["Перевозчик", 16], ["Покупатель", 30], ["Сумма", 14],
+  ["Валюта", 8], ["Литры", 11], ["Позиций", 9], ["Поставщик", 24], ["Дата", 11], ["Статус", 12], ["Что проверить", 55], ["Файл", 34],
+];
+export const COLUMNS = COLUMNS_ITEMS;
 const FILL = { [OK]: "FFE2F0D9", [WARN]: "FFFFF2CC", [ERROR]: "FFF8CBAD", [EDITED]: "FFDDEBF7" };
 const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const DATE_COLS = new Set(["Дата", "Дата отгрузки"]);
+const NUM_FMT = { "Сумма": "#,##0.00", "Сумма без НДС": "#,##0.00", "НДС": "#,##0.00", "Цена за л": "#,##0.00##", "Позиций": "0" };
 
 const isoToDate = (iso) => { const [y, m, d] = iso.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d)); };
 const dateToIso = (d) => `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
@@ -18,11 +25,20 @@ export function rowNotes(row) {
   return msgs.join("; ") || null;
 }
 
-export async function exportOurTable(table) {
+export function cellValue(name, row) {
+  if (name === "Статус") return row.status;
+  if (name === "Что проверить") return rowNotes(row);
+  if (name === "Файл") return row.file;
+  const v = row.values[name];
+  return DATE_COLS.has(name) && v ? isoToDate(v) : v ?? null;
+}
+
+export async function exportOurTable(table, layout = "summary") {
+  const columns = layout === "items" ? COLUMNS_ITEMS : COLUMNS_SUMMARY;
   const wb = new ExcelJS.Workbook();
   wb.creator = "Счета → Excel";
   const ws = wb.addWorksheet("Счета", { views: [{ state: "frozen", ySplit: 1 }] });
-  ws.columns = COLUMNS.map(([header, width]) => ({ header, width }));
+  ws.columns = columns.map(([header, width]) => ({ header, width }));
   const h = ws.getRow(1);
   h.height = 30;
   h.eachCell((c) => {
@@ -31,25 +47,20 @@ export async function exportOurTable(table) {
     c.alignment = { vertical: "middle", wrapText: true };
   });
   table.rows.forEach((row, i) => {
-    const v = row.values;
     const r = ws.getRow(i + 2);
-    const vals = [v["Название"], v["Сумма"], v["Литры"], v["Дата"] ? isoToDate(v["Дата"]) : null,
-      v["Дата отгрузки"] ? isoToDate(v["Дата отгрузки"]) : null, v["Валюта"], v["Цена за л"], v["Поставщик"], v["№ счёта"],
-      row.status, rowNotes(row), row.link ? { text: row.file, hyperlink: row.link } : row.file];
-    vals.forEach((x, j) => {
+    columns.forEach(([name], j) => {
       const c = r.getCell(j + 1);
-      c.value = x ?? null;
+      const v = cellValue(name, row);
+      c.value = name === "Файл" && row.link ? { text: row.file, hyperlink: row.link } : v;
       c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: FILL[row.status] || FILL[OK] } };
-      c.alignment = { vertical: "top", wrapText: [0, 7, 10].includes(j) };
+      c.alignment = { vertical: "top", wrapText: ["Название", "Поставщик", "Покупатель", "Что проверить"].includes(name) };
+      if (DATE_COLS.has(name)) c.numFmt = "dd.mm.yyyy";
+      else if (name === "Литры") c.numFmt = Number.isInteger(row.values["Литры"]) ? "#,##0" : "#,##0.00#";
+      else if (NUM_FMT[name]) c.numFmt = NUM_FMT[name];
+      if (name === "Статус") c.font = { bold: true };
     });
-    r.getCell(2).numFmt = "#,##0.00";
-    r.getCell(3).numFmt = Number.isInteger(v["Литры"]) ? "#,##0" : "#,##0.00#";
-    r.getCell(4).numFmt = r.getCell(5).numFmt = "dd.mm.yyyy";
-    r.getCell(7).numFmt = "#,##0.00##";
-    r.getCell(10).font = { bold: true };
-    if (row.link) r.getCell(12).font = { color: { argb: "FF0563C1" }, underline: true };
   });
-  if (table.rows.length) ws.autoFilter = { from: "A1", to: `L${table.rows.length + 1}` };
+  if (table.rows.length) ws.autoFilter = { from: "A1", to: { row: table.rows.length + 1, column: columns.length } };
 
   const log = wb.addWorksheet("Журнал");
   log.columns = [["Время", 17], ["Файл", 40], ["Результат", 70], ["Строк добавлено", 10], ["Модель", 18], ["Токены (вход/выход)", 18], ["Стоимость, $", 12]]
@@ -60,7 +71,6 @@ export async function exportOurTable(table) {
   const svc = wb.addWorksheet("_служебное", { state: "hidden" });
   svc.addRow(["ключ счёта", "sha256 файла", "строка в «Счета»", "файл"]);
   table.rows.forEach((row, i) => svc.addRow([row.key, row.sha, i + 2, row.file]));
-  // дубли, которые помним без строк (например, из прошлых загрузок)
   return new Blob([await wb.xlsx.writeBuffer()], { type: XLSX_MIME });
 }
 
@@ -80,24 +90,28 @@ export async function readOurTable(arrayBuffer) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(arrayBuffer);
   const ws = wb.getWorksheet("Счета"), svc = wb.getWorksheet("_служебное");
-  if (!ws || !svc || ws.getRow(1).getCell(1).value !== "Название") return null;
+  if (!ws || !svc) return null;
   const header = {};
-  ws.getRow(1).eachCell((c, col) => { header[c.value] = col; });
+  ws.getRow(1).eachCell((c, col) => { header[cellText(c.value)] = col; });
+  if (!header["Статус"] || !header["Что проверить"]) return null;
   const get = (r, name) => (header[name] ? cellText(r.getCell(header[name]).value) : null);
+  const numOrNull = (x) => (typeof x === "number" ? x : x === null || x === undefined || x === "" ? null : Number(String(x).replace(/\s/g, "").replace(",", ".")) || null);
+  const NUMERIC = new Set(["Сумма", "Литры", "Цена за л", "Позиций", "Сумма без НДС", "НДС"]);
   const rows = [];
   for (let i = 2; i <= ws.rowCount; i++) {
     const r = ws.getRow(i);
-    if (!get(r, "Название") && !get(r, "Сумма")) continue;
-    const status = [OK, WARN, ERROR, EDITED].includes(get(r, "Статус")) ? get(r, "Статус") : OK;
+    const values = {};
+    for (const name of Object.keys(header)) {
+      if (["Статус", "Что проверить", "Файл"].includes(name)) continue;
+      const v = get(r, name);
+      values[name] = NUMERIC.has(name) ? numOrNull(v) : v === null || v === undefined ? null : String(v);
+    }
+    if (Object.values(values).every((v) => v === null)) continue;
+    const st = get(r, "Статус");
+    const status = [OK, WARN, ERROR, EDITED].includes(st) ? st : OK;
     const notes = get(r, "Что проверить");
-    const numOrNull = (x) => (typeof x === "number" ? x : x === null ? null : Number(String(x).replace(/\s/g, "").replace(",", ".")) || null);
-    rows.push({
-      values: { "Название": get(r, "Название"), "Сумма": numOrNull(get(r, "Сумма")), "Литры": numOrNull(get(r, "Литры")),
-        "Дата": get(r, "Дата"), "Дата отгрузки": get(r, "Дата отгрузки"), "Валюта": get(r, "Валюта"),
-        "Цена за л": numOrNull(get(r, "Цена за л")), "Поставщик": get(r, "Поставщик"), "№ счёта": get(r, "№ счёта") != null ? String(get(r, "№ счёта")) : null },
-      status, messages: notes ? [[status === OK ? "info" : status, String(notes)]] : [], edits: [],
-      file: get(r, "Файл"), key: null, sha: null, restored: true,
-    });
+    rows.push({ values, status, messages: notes ? [[status === OK ? "info" : status, String(notes)]] : [], edits: [],
+      file: get(r, "Файл"), key: null, sha: null, restored: true });
   }
   const keys = {}, hashes = {};
   for (let i = 2; i <= svc.rowCount; i++) {

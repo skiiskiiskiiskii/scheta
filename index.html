@@ -197,12 +197,31 @@ select.inp { font-family: var(--text); font-size: 14px; min-width: 0; }
 .okmsg { color: var(--ok-fg); margin-top: 6px; }
 
 .choices { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 20px; }
+.choice.wide { grid-column: 1 / -1; }
 .choice { text-align: left; background: var(--bg); border: 2px solid transparent; border-radius: 8px; padding: 18px 20px; cursor: pointer; }
 .choice:hover { border-color: var(--amber); }
 .choice b { display: block; font-size: 17px; margin-bottom: 6px; }
 .choice span { color: var(--muted); font-size: 14px; }
 .choice input { display: none; }
 @media (max-width: 720px) { .choices { grid-template-columns: 1fr; } .panel { padding: 24px 20px; } }
+
+/* ── подключение Google ── */
+.steps li { margin: 8px 0; }
+.codebox { position: relative; margin: 8px 0 4px; }
+.codebox textarea { width: 100%; height: 150px; font: 12px/1.45 ui-monospace, "SF Mono", Menlo, monospace; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: var(--radius-s); background: var(--bg); color: var(--ink); resize: vertical; }
+.codebox .btn { position: absolute; right: 10px; top: 10px; }
+
+/* ── счёт одной строкой ── */
+.totals td { padding: 8px 10px; }
+.totals .big-num .cell { font-size: 17px; font-weight: 600; }
+details.lines { border-top: 1px solid var(--line); }
+details.lines summary { padding: 10px 18px; cursor: pointer; color: var(--muted); font-size: 14px; }
+details.lines summary b { color: var(--ink); font-weight: 600; }
+details.lines table { font-size: 13px; }
+details.lines td, details.lines th { padding: 5px 10px; }
+.lines-table col.l-n { width: 4%; } .lines-table col.l-name { width: 38%; } .lines-table col.l-q { width: 9%; }
+.lines-table col.l-l { width: 9%; } .lines-table col.l-p { width: 10%; } .lines-table col.l-s { width: 11%; } .lines-table col.l-m { width: 19%; }
 
 /* ── сопоставление колонок ── */
 .map-table { margin-top: 14px; table-layout: auto; }
@@ -270,12 +289,36 @@ dialog::backdrop { background: rgba(23, 33, 43, .45); }
     <div class="choices">
       <button class="choice" id="chooseNew" type="button"><b>Начать новую таблицу</b>
         <span>Колонки: Название, Сумма, Литры, Дата, Дата отгрузки, Валюта, Цена за л, Поставщик, № счёта и проверка.</span></button>
-      <label class="choice" id="chooseOwn"><b>Продолжить мою таблицу</b>
+      <label class="choice" id="chooseOwn"><b>Продолжить мою таблицу Excel</b>
         <span>Выберите ваш файл Excel (.xlsx). Подойдёт и таблица, скачанная с этого сайта раньше, — тогда всё восстановится как было.</span>
         <input type="file" id="ownPicker" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></label>
+      <button class="choice wide" id="chooseGoogle" type="button"><b>Писать прямо в Google Таблицу</b>
+        <span>Строки сразу появляются в вашей Google Таблице — ничего не нужно скачивать. Один раз нужно добавить в таблицу маленький скрипт (5 минут, инструкция на следующем шаге).</span></button>
     </div>
     <div class="err" id="chooseErr" role="alert"></div>
     <p class="muted" id="chooseBack" hidden><button class="btn" id="chooseCancel" type="button">Вернуться к текущей таблице</button></p>
+  </section>
+
+  <!-- 2б. подключение Google Таблицы -->
+  <section class="panel" id="viewGoogle" hidden style="max-width:900px">
+    <h2>Подключить Google Таблицу</h2>
+    <p>Делается один раз. В таблицу добавляется маленький скрипт, через который сайт дописывает строки. Скрипт работает только с этой таблицей и принимает строки только с секретным ключом, который уже вписан в код ниже.</p>
+    <ol class="steps">
+      <li>Откройте вашу Google Таблицу → меню <b>Расширения → Apps Script</b>.</li>
+      <li>В открывшемся редакторе удалите всё, что там есть, и вставьте этот код:
+        <div class="codebox"><textarea id="gsCode" readonly spellcheck="false" aria-label="Код скрипта"></textarea>
+        <button class="btn" id="gsCopy" type="button">Скопировать код</button></div></li>
+      <li>Нажмите значок дискеты (Сохранить), затем вверху справа <b>Развернуть → Новое развертывание</b>.</li>
+      <li>Шестерёнка «Выберите тип» → <b>Веб-приложение</b>. «Запуск от имени» — <b>Я</b>, «У кого есть доступ» — <b>Все</b>. Нажмите <b>Развернуть</b>.</li>
+      <li>Google попросит доступ: <b>Предоставить доступ</b> → выберите свой аккаунт → если появится «Приложение не проверено», нажмите <b>Дополнительно → Перейти на страницу…</b> → <b>Разрешить</b>. Это ваш собственный скрипт, предупреждение стандартное.</li>
+      <li>Скопируйте <b>URL веб-приложения</b> (оканчивается на <code>/exec</code>) и вставьте сюда:</li>
+    </ol>
+    <div class="field">
+      <input type="text" id="gsUrl" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off" spellcheck="false" aria-label="Ссылка на веб-приложение">
+      <button class="btn primary" id="gsConnect" type="button">Подключить</button>
+    </div>
+    <div class="err" id="gsErr" role="alert"></div>
+    <p><button class="btn" id="gsBack" type="button">Назад</button></p>
   </section>
 
   <!-- 3. сопоставление колонок -->
@@ -337,8 +380,17 @@ dialog::backdrop { background: rgba(23, 33, 43, .45); }
     <div class="err" id="keyErr2" role="alert"></div>
     <h3>Модель</h3>
     <select class="inp" id="modelSelect" aria-label="Модель"></select>
+    <h3>Как записывать счёт</h3>
+    <select class="inp" id="layoutSelect" aria-label="Как записывать счёт">
+      <option value="summary">Одной строкой: итоговая сумма и литры по счёту</option>
+      <option value="items">По строке на каждую позицию счёта</option>
+    </select>
     <h3>Таблица</h3>
     <div class="row"><span id="tableInfo"></span></div>
+    <div id="shareBox" hidden style="margin-top:10px">
+      <p class="muted" style="margin:0 0 6px">Ссылка с этой настройкой: тот, кто её откроет, сразу будет писать в эту же Google Таблицу — останется только вставить свой ключ OpenAI. Ссылку не публикуйте: с ней можно добавлять строки в таблицу.</p>
+      <div class="field" style="margin:0"><input type="text" id="shareLink" readonly aria-label="Ссылка с настройкой"><button class="btn" id="shareCopy" type="button">Скопировать ссылку</button></div>
+    </div>
     <div class="row" style="margin-top:8px"><button class="btn" id="dlBtn2" type="button">Скачать таблицу</button>
       <button class="btn" id="dlCopy" type="button" hidden>Скачать копию в формате сайта</button>
       <button class="btn" id="changeTable" type="button">Сменить таблицу…</button></div>
