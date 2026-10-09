@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Счета → Excel</title>
+<meta name="description" content="Распознавание PDF-счетов и запись в Excel. Работает в браузере, ключ и счета остаются на вашем компьютере.">
+<link rel="stylesheet" href="fonts/fonts.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23e3a21a'/%3E%3Cpath d='M9 9h14M9 15h14M9 21h9' stroke='%233a2700' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<script src="vendor/exceljs.min.js" defer></script>
+<script src="vendor/jszip.min.js" defer></script>
+<style>
+:root {
+  --bg: #e9edf0;
+  --surface: #ffffff;
+  --ink: #17212b;
+  --muted: #5d6974;
+  --line: #d2d9df;
+  --amber: #e3a21a;
+  --amber-hot: #f0b532;
+  --amber-ink: #3a2700;
+  --ok-bg: #e2f0d9;   --ok-fg: #2d6627;
+  --warn-bg: #fff2cc; --warn-fg: #725200;
+  --err-bg: #f8cbad;  --err-fg: #8a2a0f;
+  --edit-bg: #ddebf7; --edit-fg: #1f4e79;
+  --grey-bg: #eef1f3; --grey-fg: #5d6974;
+  --radius-s: 6px;
+  --display: "Unbounded", "Segoe UI", system-ui, sans-serif;
+  --text: "Golos Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--ink);
+  font: 15px/1.45 var(--text);
+  font-variant-numeric: tabular-nums;
+  padding-bottom: 110px;
+}
+button, input { font: inherit; color: inherit; }
+:focus-visible { outline: 3px solid #1f4e79; outline-offset: 2px; }
+
+/* ── шапка ── */
+header {
+  display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; justify-content: space-between;
+  max-width: 1180px; margin: 0 auto; padding: 22px 24px 16px;
+}
+h1 { font: 700 22px/1.1 var(--display); margin: 0; letter-spacing: -0.01em; }
+.engine { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 14px; }
+.engine .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok-fg); flex: none; }
+.engine.bad .dot { background: var(--err-fg); }
+.engine.bad { color: var(--err-fg); }
+.head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.btn {
+  border: 1px solid var(--line); background: var(--surface); border-radius: var(--radius-s);
+  padding: 8px 14px; cursor: pointer; font-weight: 500; text-decoration: none; display: inline-block; color: var(--ink);
+}
+.btn:hover { border-color: #9aa6b0; }
+.btn.primary { background: var(--amber); border-color: var(--amber); color: var(--amber-ink); font-weight: 700; padding: 11px 22px; }
+.btn.primary:hover { background: var(--amber-hot); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+main { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
+
+/* ── зона перетаскивания: единственный громкий элемент ── */
+.drop {
+  position: relative; display: block; cursor: pointer;
+  background: var(--amber); color: var(--amber-ink);
+  border-radius: 10px; padding: 56px 40px 48px;
+  transition: padding .25s ease, background .15s ease;
+}
+.drop:hover, .drop.over { background: var(--amber-hot); }
+.drop.over { box-shadow: inset 0 0 0 4px var(--amber-ink); }
+.drop .big { font: 700 clamp(26px, 4.2vw, 44px)/1.05 var(--display); letter-spacing: -0.02em; max-width: 16ch; }
+.drop .small { margin-top: 14px; font-size: 16px; max-width: 60ch; }
+.drop .small u { text-underline-offset: 3px; }
+.drop.compact { padding: 18px 24px; }
+.drop.compact .big { font-size: 18px; max-width: none; }
+.drop.compact .small { display: none; }
+.drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+
+.progress { margin: 16px 2px 0; color: var(--muted); display: none; }
+.progress.on { display: block; }
+.bar { height: 4px; background: var(--line); border-radius: 2px; margin-top: 8px; overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; background: var(--amber); transition: width .3s ease; }
+
+.notice { margin-top: 16px; padding: 14px 18px; border-radius: var(--radius-s); display: none; }
+.notice.on { display: block; }
+.notice.good { background: var(--ok-bg); color: var(--ok-fg); }
+.notice.bad { background: var(--err-bg); color: var(--err-fg); }
+.notice .btn { margin-left: 12px; }
+
+.summary { margin: 26px 2px 10px; display: flex; flex-wrap: wrap; gap: 6px 22px; color: var(--muted); }
+.summary b { color: var(--ink); }
+.summary .sq { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: 0; }
+
+/* ── счёт ── */
+.invoice {
+  background: var(--surface); margin-top: 14px; border-radius: var(--radius-s);
+  border-left: 6px solid var(--ok-fg); overflow: hidden;
+}
+.invoice.s-warn { border-left-color: #d6a200; }
+.invoice.s-err { border-left-color: var(--err-fg); }
+.invoice.s-edit { border-left-color: var(--edit-fg); }
+.invoice.off { opacity: .55; }
+.inv-top { display: flex; align-items: center; gap: 12px; padding: 14px 18px 4px; flex-wrap: wrap; }
+.inv-top label { display: flex; align-items: center; gap: 10px; font-weight: 600; cursor: pointer; }
+.inv-top input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--ink); }
+.inv-top a { color: var(--edit-fg); font-size: 14px; }
+.inv-top .spacer { flex: 1; }
+.meta { display: flex; flex-wrap: wrap; gap: 4px 18px; padding: 6px 18px 10px; }
+.meta label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); }
+.head-msgs { padding: 0 18px 8px; font-size: 14px; }
+.head-msgs div { margin-top: 2px; }
+
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+col.c-name { width: 34%; } col.c-sum { width: 13%; } col.c-l { width: 9%; } col.c-p { width: 9%; }
+col.c-st { width: 10%; } col.c-msg { width: 25%; }
+th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); padding: 8px 10px; border-top: 1px solid var(--line); }
+td { padding: 4px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+td.num, th.num { text-align: right; }
+td.msgs { font-size: 13px; color: var(--ink); min-width: 220px; padding-top: 9px; }
+.lvl-info { color: var(--muted); }
+.lvl-ПРОВЕРИТЬ { color: var(--warn-fg); }
+.lvl-ОШИБКА { color: var(--err-fg); font-weight: 500; }
+
+.cell {
+  width: 100%; border: 1px solid transparent; background: transparent; border-radius: 4px;
+  padding: 5px 6px; min-width: 0;
+}
+.cell:hover { border-color: var(--line); }
+.cell:focus { border-color: var(--edit-fg); background: #fff; outline: none; box-shadow: 0 0 0 2px var(--edit-bg); }
+.cell.num { text-align: right; }
+.cell.edited { background: var(--edit-bg); color: var(--edit-fg); }
+.cell.invalid { border-color: var(--err-fg); background: var(--err-bg); }
+.meta .cell { width: auto; font-size: 15px; color: var(--ink); padding: 3px 6px; margin-left: -6px; }
+.meta .w-wide { width: 260px; }
+.meta .w-mid { width: 150px; }
+.meta .w-date { width: 120px; }
+.meta .w-s { width: 70px; }
+
+.pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.p-OK { background: var(--ok-bg); color: var(--ok-fg); }
+.p-ПРОВЕРИТЬ { background: var(--warn-bg); color: var(--warn-fg); }
+.p-ОШИБКА { background: var(--err-bg); color: var(--err-fg); }
+.p-ИСПРАВЛЕНО { background: var(--edit-bg); color: var(--edit-fg); }
+.p-grey { background: var(--grey-bg); color: var(--grey-fg); }
+tr.r-OK td { background: color-mix(in srgb, var(--ok-bg) 35%, white); }
+tr.r-ПРОВЕРИТЬ td { background: color-mix(in srgb, var(--warn-bg) 55%, white); }
+tr.r-ОШИБКА td { background: color-mix(in srgb, var(--err-bg) 40%, white); }
+tr.r-ИСПРАВЛЕНО td { background: color-mix(in srgb, var(--edit-bg) 45%, white); }
+
+/* дубль / не счёт / сбой — одной строкой */
+.skip { background: var(--surface); margin-top: 10px; border-radius: var(--radius-s); border-left: 6px solid #a8b2bb;
+        padding: 12px 18px; display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.skip.fail { border-left-color: var(--err-fg); }
+.skip .fn { font-weight: 600; }
+.skip .why { color: var(--muted); }
+
+/* нижняя панель */
+.dock {
+  position: fixed; left: 0; right: 0; bottom: 0; background: var(--ink); color: #fff;
+  transform: translateY(110%); transition: transform .25s ease;
+}
+.dock.on { transform: none; }
+.dock-in { max-width: 1180px; margin: 0 auto; padding: 14px 24px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.dock .what { flex: 1; min-width: 220px; }
+.dock .what small { display: block; color: #b8c2cb; }
+.dock .btn.ghost { background: transparent; color: #fff; border-color: #55626e; }
+
+.empty-hint { color: var(--muted); margin: 28px 2px; max-width: 70ch; }
+.empty-hint ul { padding-left: 20px; margin: 8px 0 0; }
+
+@media (max-width: 720px) {
+  header, main { padding-left: 16px; padding-right: 16px; }
+  .drop { padding: 32px 22px; }
+  .table-wrap { overflow-x: auto; }
+  table { min-width: 760px; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+/* ── экраны первого входа ── */
+.panel { background: var(--surface); border-radius: 10px; padding: 34px 36px 32px; max-width: 760px; margin: 18px 0 0; }
+.panel h2 { font: 700 26px/1.15 var(--display); margin: 0 0 12px; letter-spacing: -0.01em; }
+.panel p { margin: 0 0 12px; max-width: 64ch; }
+.panel .muted, .muted { color: var(--muted); }
+.panel ol { margin: 6px 0 16px; padding-left: 22px; max-width: 64ch; }
+.panel ol li { margin: 4px 0; }
+.field { display: flex; gap: 10px; flex-wrap: wrap; margin: 16px 0 8px; }
+.field input[type=text], .field input[type=password], select.inp {
+  flex: 1; min-width: 260px; padding: 11px 12px; border: 1px solid var(--line); border-radius: var(--radius-s); background: #fff;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 14px;
+}
+select.inp { font-family: var(--text); font-size: 14px; min-width: 0; }
+.err { color: var(--err-fg); margin-top: 6px; min-height: 1.4em; }
+.okmsg { color: var(--ok-fg); margin-top: 6px; }
+
+.choices { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 20px; }
+.choice { text-align: left; background: var(--bg); border: 2px solid transparent; border-radius: 8px; padding: 18px 20px; cursor: pointer; }
+.choice:hover { border-color: var(--amber); }
+.choice b { display: block; font-size: 17px; margin-bottom: 6px; }
+.choice span { color: var(--muted); font-size: 14px; }
+.choice input { display: none; }
+@media (max-width: 720px) { .choices { grid-template-columns: 1fr; } .panel { padding: 24px 20px; } }
+
+/* ── сопоставление колонок ── */
+.map-table { margin-top: 14px; table-layout: auto; }
+.map-table td, .map-table th { padding: 8px 10px; }
+.map-table td.col { font-weight: 700; color: var(--muted); width: 44px; }
+.map-table td.samples { color: var(--muted); font-size: 13px; }
+.map-table select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px; background: #fff; font: inherit; font-size: 14px; max-width: 260px; }
+.map-table tr.mapped td { background: color-mix(in srgb, var(--ok-bg) 45%, white); }
+.map-hint { margin-top: 12px; padding: 10px 14px; border-radius: var(--radius-s); background: var(--warn-bg); color: var(--warn-fg); }
+.map-actions { display: flex; gap: 10px; margin-top: 20px; flex-wrap: wrap; align-items: center; }
+
+/* ── напоминание скачать ── */
+.remind { margin: 0 0 14px; padding: 12px 16px; border-radius: var(--radius-s); background: var(--surface); border-left: 6px solid var(--amber);
+  display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.remind span { flex: 1; min-width: 220px; }
+.tablechip { color: var(--muted); font-size: 14px; }
+.tablechip b { color: var(--ink); font-weight: 600; }
+
+/* ── настройки ── */
+dialog { border: none; border-radius: 10px; padding: 0; max-width: 720px; width: calc(100% - 32px); color: var(--ink); }
+dialog::backdrop { background: rgba(23, 33, 43, .45); }
+.dlg { padding: 26px 28px 24px; }
+.dlg h2 { font: 700 20px/1.2 var(--display); margin: 0 0 6px; }
+.dlg h3 { font-size: 15px; margin: 22px 0 6px; }
+.dlg .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.dlg .close { float: right; }
+.journal { font-size: 13px; max-height: 240px; overflow: auto; border: 1px solid var(--line); border-radius: var(--radius-s); margin-top: 6px; }
+.journal table { table-layout: auto; }
+.journal td { padding: 5px 8px; }
+.danger { color: var(--err-fg); border-color: color-mix(in srgb, var(--err-fg) 40%, white); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Счета → Excel</h1>
+  <div class="tablechip" id="tableChip"></div>
+  <div class="head-actions" id="headActions" hidden>
+    <button class="btn" id="dlBtn" type="button">Скачать таблицу</button>
+    <button class="btn" id="settingsBtn" type="button">Настройки</button>
+  </div>
+</header>
+
+<main>
+  <!-- 1. ключ -->
+  <section class="panel" id="viewKey" hidden>
+    <h2>Ключ OpenAI</h2>
+    <p>Счета распознаёт ИИ от OpenAI, за распознавание платит владелец ключа: примерно 1–2 цента за счёт.</p>
+    <ol>
+      <li>Зайдите на <b>platform.openai.com</b> → Billing и пополните баланс (от $5).</li>
+      <li>Там же → <b>API keys</b> → <b>Create new secret key</b>, права <b>All</b>. Скопируйте ключ — он начинается с <code>sk-</code>.</li>
+      <li>Вставьте его сюда.</li>
+    </ol>
+    <div class="field">
+      <input type="password" id="keyInput" placeholder="sk-proj-…" autocomplete="off" spellcheck="false" aria-label="Ключ OpenAI">
+      <button class="btn primary" id="keySave" type="button">Проверить и сохранить</button>
+    </div>
+    <div class="err" id="keyErr" role="alert"></div>
+    <p class="muted">Ключ хранится только в этом браузере на этом компьютере и отправляется только в OpenAI.</p>
+  </section>
+
+  <!-- 2. выбор таблицы -->
+  <section class="panel" id="viewChoose" hidden>
+    <h2>С какой таблицей работаем?</h2>
+    <p>Можно начать новую или продолжить вашу: сайт сам найдёт в ней колонки и будет дописывать строки в конец.</p>
+    <div class="choices">
+      <button class="choice" id="chooseNew" type="button"><b>Начать новую таблицу</b>
+        <span>Колонки: Название, Сумма, Литры, Дата, Дата отгрузки, Валюта, Цена за л, Поставщик, № счёта и проверка.</span></button>
+      <label class="choice" id="chooseOwn"><b>Продолжить мою таблицу</b>
+        <span>Выберите ваш файл Excel (.xlsx). Подойдёт и таблица, скачанная с этого сайта раньше, — тогда всё восстановится как было.</span>
+        <input type="file" id="ownPicker" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></label>
+    </div>
+    <div class="err" id="chooseErr" role="alert"></div>
+    <p class="muted" id="chooseBack" hidden><button class="btn" id="chooseCancel" type="button">Вернуться к текущей таблице</button></p>
+  </section>
+
+  <!-- 3. сопоставление колонок -->
+  <section class="panel" id="viewMap" hidden style="max-width:1100px">
+    <h2>Колонки вашей таблицы</h2>
+    <p id="mapIntro"></p>
+    <div class="field" id="sheetField" hidden><label class="muted">Лист: <select class="inp" id="sheetSelect"></select></label>
+      <label class="muted">Строка с заголовками: <select class="inp" id="headerSelect"></select></label></div>
+    <div id="mapHint" class="map-hint" hidden></div>
+    <div class="table-wrap"><table class="map-table" id="mapTable"></table></div>
+    <div class="map-actions">
+      <button class="btn primary" id="mapSave" type="button">Сохранить и начать работу</button>
+      <button class="btn" id="mapCancel" type="button">Назад</button>
+      <span class="muted" id="mapNote"></span>
+    </div>
+    <div class="err" id="mapErr" role="alert"></div>
+  </section>
+
+  <!-- 4. работа -->
+  <section id="viewWork" hidden>
+    <div class="remind" id="remind" hidden><span id="remindText"></span><button class="btn" id="remindDl" type="button">Скачать таблицу</button></div>
+    <label class="drop" id="drop">
+      <div class="big" id="dropBig">Перетащите PDF‑счета сюда</div>
+      <div class="small">Можно сразу пачку. Или <u>выберите файлы</u> на компьютере — каждый счёт распознается и проверится, в таблицу ничего не попадёт, пока вы не нажмёте «Добавить в таблицу».</div>
+      <input type="file" id="picker" accept="application/pdf,.pdf" multiple>
+    </label>
+    <div class="progress" id="progress"><span id="progressText"></span><div class="bar"><i id="barFill"></i></div></div>
+    <div class="notice" id="notice"></div>
+    <div class="empty-hint" id="emptyHint">
+      Что проверяется в каждом счёте:
+      <ul>
+        <li>количество × цена = сумма строки, сумма строк = итог, без НДС + НДС = с НДС;</li>
+        <li>каждое число и дата есть в самом PDF — если ИИ ошибся в цифре, строка станет красной;</li>
+        <li>если в счёте штуки, литры считаются из объёма в названии: 24 ks × «4 l» = 96 л;</li>
+        <li>повторно присланный счёт в таблицу не попадёт.</li>
+      </ul>
+    </div>
+    <div class="summary" id="summary" hidden></div>
+    <div id="results"></div>
+  </section>
+</main>
+
+<div class="dock" id="dock">
+  <div class="dock-in">
+    <div class="what"><span id="dockWhat"></span><small id="dockSub"></small></div>
+    <button class="btn ghost" id="clearBtn" type="button">Очистить список</button>
+    <button class="btn primary" id="commitBtn" type="button">Добавить в таблицу</button>
+  </div>
+</div>
+
+<dialog id="settings">
+  <div class="dlg">
+    <button class="btn close" id="settingsClose" type="button">Закрыть</button>
+    <h2>Настройки</h2>
+    <h3>Ключ OpenAI</h3>
+    <div class="row"><span id="keyMasked" class="muted"></span></div>
+    <div class="field"><input type="password" id="keyInput2" placeholder="Новый ключ sk-proj-…" autocomplete="off" spellcheck="false" aria-label="Новый ключ">
+      <button class="btn" id="keySave2" type="button">Заменить ключ</button></div>
+    <div class="err" id="keyErr2" role="alert"></div>
+    <h3>Модель</h3>
+    <select class="inp" id="modelSelect" aria-label="Модель"></select>
+    <h3>Таблица</h3>
+    <div class="row"><span id="tableInfo"></span></div>
+    <div class="row" style="margin-top:8px"><button class="btn" id="dlBtn2" type="button">Скачать таблицу</button>
+      <button class="btn" id="dlCopy" type="button" hidden>Скачать копию в формате сайта</button>
+      <button class="btn" id="changeTable" type="button">Сменить таблицу…</button></div>
+    <h3>Журнал</h3>
+    <div class="muted" id="spent"></div>
+    <div class="journal"><table id="journalTable"></table></div>
+    <h3>Данные в этом браузере</h3>
+    <p class="muted" style="margin:0 0 8px">Таблица, журнал и ключ хранятся только в этом браузере. Если очистить данные браузера, они пропадут — поэтому скачивайте таблицу после работы. Восстановить всё можно, загрузив скачанную таблицу через «Сменить таблицу».</p>
+    <button class="btn danger" id="wipeBtn" type="button">Стереть всё из этого браузера</button>
+  </div>
+</dialog>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
